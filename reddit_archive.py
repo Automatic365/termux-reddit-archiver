@@ -17,12 +17,33 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from itertools import combinations
 from pathlib import Path
+from typing import Iterator
 
-VERSION = "1.6.0"
+VERSION = "1.10.0"
 USER_AGENT = f"termux-reddit-archive/{VERSION} (personal archival use)"
 ARCTIC_SEARCH = "https://arctic-shift.photon-reddit.com/api/posts/search"
+PULLPUSH_SEARCH = "https://api.pullpush.io/reddit/search/submission/"
+UPDATE_URL = "https://raw.githubusercontent.com/Automatic365/termux-reddit-archiver/main/reddit_archive.py"
+
+# Metadata sources in order of preference; later ones are only used when earlier ones fail.
+SOURCES = {
+    "arctic_shift": {
+        "name": "Arctic Shift",
+        "url": ARCTIC_SEARCH,
+        "params": {"sort": "desc", "limit": "100"},
+        "page_delay": 1,
+    },
+    "pullpush": {
+        "name": "PullPush",
+        "url": PULLPUSH_SEARCH,
+        "params": {"sort": "desc", "sort_type": "created_utc", "size": "100"},
+        "page_delay": 4,  # PullPush rate limits at roughly 15 requests per minute
+    },
+}
+
+# Re-check this far behind the newest known post, to catch posts archived late.
+INCREMENTAL_OVERLAP = 3 * 24 * 60 * 60
 
 DEFAULT_MANIFEST_ROOT = Path("/storage/emulated/0/Download/reddit_manifests")
 DEFAULT_MEDIA_ROOT = Path("/storage/emulated/0")
@@ -41,6 +62,13 @@ MIME_EXTENSIONS = {
 
 # HTTP codes that mean the media is gone for good, not temporarily unavailable.
 GONE_HTTP_CODES = {404, 410}
+
+# Give up on an item after this many failed runs (connection problems don't count).
+MAX_DOWNLOAD_ATTEMPTS = 5
+
+# Post metadata requests fail fast so a hanging source quickly hands over to the next one.
+METADATA_TIMEOUT = 30
+METADATA_RETRIES = 3
 
 ARCHIVED_STATUSES = {"downloaded", "existing"}
 DUPLICATE_STATUSES = {"deleted_exact_duplicate", "deleted_visual_duplicate"}
@@ -68,15 +96,25 @@ def read_json(path: Path, default):
         return default
 
 
-def request(url: str, retries: int = 5):
+def rate_limit_delay(error: urllib.error.HTTPError, default: float = 30) -> float:
+    """Seconds to wait after a 429; tolerates missing, decimal or date-valued headers."""
+    for header in ("Retry-After", "X-RateLimit-Reset"):
+        try:
+            return float(error.headers.get(header))
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def request(url: str, retries: int = 5, timeout: float = 60):
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            return urllib.request.urlopen(req, timeout=60)
+            return urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as error:
             if error.code == 429 and attempt < retries - 1:
-                delay = int(error.headers.get("X-RateLimit-Reset", "30") or 30)
-                print(f"Rate limited; waiting {delay} seconds", file=sys.stderr)
+                delay = rate_limit_delay(error)
+                print(f"Rate limited; waiting {delay:g} seconds", file=sys.stderr)
                 time.sleep(min(max(delay, 1), 300))
                 continue
             if error.code == 422 and attempt < retries - 1:
@@ -95,7 +133,7 @@ def request(url: str, retries: int = 5):
 
 
 def request_json(url: str):
-    with request(url) as response:
+    with request(url, retries=METADATA_RETRIES, timeout=METADATA_TIMEOUT) as response:
         return json.load(response)
 
 
@@ -126,6 +164,29 @@ def sort_posts(posts) -> list[dict]:
     )
 
 
+def created(post: dict) -> int | None:
+    value = post.get("created_utc")
+    return int(float(value)) if value is not None else None
+
+
+def load_checkpoint(path: Path, saved_posts: list[dict]) -> dict:
+    """Per-source crawl state, upgrading the single-source format from v1.7 and earlier."""
+    checkpoint = read_json(path, {})
+    if not isinstance(checkpoint, dict):
+        return {}
+    if "complete" in checkpoint or "before" in checkpoint:
+        timestamps = [ts for ts in map(created, saved_posts) if ts is not None]
+        before = checkpoint.get("before")
+        if before is None and not checkpoint.get("complete") and timestamps:
+            before = min(timestamps)
+        checkpoint = {"arctic_shift": {
+            "complete": bool(checkpoint.get("complete")),
+            "before": before,
+            "newest": max(timestamps) if timestamps else None,
+        }}
+    return {key: value for key, value in checkpoint.items() if key in SOURCES and isinstance(value, dict)}
+
+
 def inspect_manifest_history(manifest_dir: Path) -> dict:
     state_file = manifest_dir / "state.json"
     posts_file = manifest_dir / "posts.json"
@@ -133,7 +194,7 @@ def inspect_manifest_history(manifest_dir: Path) -> dict:
 
     saved_posts = load_saved_posts(posts_file)
     state = read_json(state_file, {})
-    checkpoint = read_json(checkpoint_file, {})
+    checkpoint = load_checkpoint(checkpoint_file, saved_posts)
 
     print(f"--- Manifest Check: {manifest_dir.name} ---")
     if not manifest_dir.exists() or (not state and not saved_posts):
@@ -150,9 +211,58 @@ def inspect_manifest_history(manifest_dir: Path) -> dict:
         print(f"  - Duplicates:     {duplicates}")
         print(f"  - Dead/404s:      {dead}")
         print(f"  - Transient fail: {failed}")
-        print(f"Metadata Status:    {'Complete' if checkpoint.get('complete') else 'Partial/In-progress'}")
+        for key, source in SOURCES.items():
+            if key in checkpoint:
+                status = "Complete" if checkpoint[key].get("complete") else "Partial/In-progress"
+            else:
+                status = "Not used yet"
+            print(f"{source['name'] + ':':<20}{status}")
     print("----------------------------------------\n")
     return state
+
+
+def merge_post(existing: dict | None, incoming: dict) -> dict:
+    """Keep what we already have, filling in any fields the earlier copy was missing."""
+    if not existing:
+        return incoming
+    merged = dict(incoming)
+    merged.update({key: value for key, value in existing.items() if value not in (None, "", [], {})})
+    return merged
+
+
+def crawl_source(source: dict, username: str, before: int | None, stop_at: int | None, on_page) -> None:
+    """Page backwards from `before` until history ends or posts reach `stop_at`.
+
+    Raises on request errors and malformed pages, so an outage is never
+    mistaken for the end of a user's history.
+    """
+    seen: set[str] = set()
+    while True:
+        query = {"author": username, **source["params"]}
+        if before is not None:
+            query["before"] = str(before)
+        batch = normalize_post_response(request_json(source["url"] + "?" + urllib.parse.urlencode(query)))
+        if not batch:
+            return
+        timestamps = [ts for ts in map(created, batch) if ts is not None]
+        if not timestamps:
+            raise ValueError(f"{source['name']} returned posts without timestamps")
+
+        ids = {str(post.get("id") or "") for post in batch} - {""}
+        fresh = ids - seen
+        seen |= ids
+        oldest = min(timestamps)
+        # Overlap by one second so posts sharing the boundary timestamp are not
+        # skipped, but always move strictly backwards so paging terminates.
+        cursor = oldest + 1 if fresh else oldest
+        if before is not None:
+            cursor = min(cursor, before - 1)
+        on_page(batch, cursor, max(timestamps))
+
+        if stop_at is not None and oldest <= stop_at:
+            return
+        before = cursor
+        time.sleep(source["page_delay"])
 
 
 def fetch_all_posts(username: str, destination: Path) -> tuple[list[dict], str | None]:
@@ -161,70 +271,62 @@ def fetch_all_posts(username: str, destination: Path) -> tuple[list[dict], str |
         str(post["id"]): post for post in saved_posts if post.get("id")
     }
     checkpoint_path = destination.with_name("metadata_checkpoint.json")
-    checkpoint = read_json(checkpoint_path, {})
-    if not isinstance(checkpoint, dict):
-        checkpoint = {}
+    checkpoint = load_checkpoint(checkpoint_path, saved_posts)
 
-    def crawl(before: int | None, stop_when_caught_up: bool, track_checkpoint: bool) -> None:
-        """Page backwards from `before`. Raises on request errors."""
-        while True:
-            query = {"author": username, "sort": "desc", "limit": "100"}
-            if before is not None:
-                query["before"] = str(before)
-            batch = normalize_post_response(request_json(ARCTIC_SEARCH + "?" + urllib.parse.urlencode(query)))
+    def save_batch(batch: list[dict]) -> None:
+        for post in batch:
+            post_id = str(post.get("id") or "")
+            if post_id:
+                posts_by_id[post_id] = merge_post(posts_by_id.get(post_id), post)
+        write_json(destination, sort_posts(posts_by_id.values()))
 
-            if not batch:
-                if track_checkpoint:
-                    write_json(checkpoint_path, {"complete": True, "before": before, "posts_saved": len(posts_by_id)})
-                return
+    def sync(key: str) -> None:
+        source = SOURCES[key]
+        progress = checkpoint.setdefault(key, {})
 
-            new_posts_found = 0
-            for post in batch:
-                post_id = str(post.get("id") or "")
-                if not post_id:
-                    continue
-                if post_id not in posts_by_id:
-                    new_posts_found += 1
-                posts_by_id[post_id] = post
-            write_json(destination, sort_posts(posts_by_id.values()))
+        if progress.get("newest") is not None:
+            # Pick up anything posted since this source's last successful run
+            newest = progress["newest"]
 
-            timestamps = [int(float(item["created_utc"])) for item in batch if item.get("created_utc") is not None]
-            if not timestamps:
-                return
-            oldest = min(timestamps)
-            if before is not None and oldest >= before:
-                return
-            before = oldest
+            def on_new_page(batch, cursor, page_newest):
+                nonlocal newest
+                save_batch(batch)
+                newest = max(newest, page_newest)
 
-            if track_checkpoint:
-                write_json(checkpoint_path, {"complete": False, "before": before, "posts_saved": len(posts_by_id)})
+            crawl_source(source, username, None, progress["newest"] - INCREMENTAL_OVERLAP, on_new_page)
+            progress["newest"] = newest
+            write_json(checkpoint_path, checkpoint)
 
-            # Reached posts we already have: everything newer has been collected
-            if stop_when_caught_up and new_posts_found == 0:
-                return
-            time.sleep(1)
+        if not progress.get("complete"):
+            if progress.get("before") is not None:
+                print(f"Resuming incomplete {source['name']} metadata fetch from {progress['before']}")
 
-    try:
-        if posts_by_id:
-            # Pick up anything posted since the last run
-            crawl(None, stop_when_caught_up=True, track_checkpoint=False)
-            if checkpoint.get("complete"):
-                print("Upstream post archive is up to date.")
-                return sort_posts(posts_by_id.values()), None
+            def on_history_page(batch, cursor, page_newest):
+                save_batch(batch)
+                progress["before"] = cursor
+                progress["newest"] = max(progress.get("newest") or page_newest, page_newest)
+                write_json(checkpoint_path, checkpoint)
 
-            # A previous metadata fetch stopped early; resume where it left off
-            resume = checkpoint.get("before")
-            if resume is None:
-                timestamps = [int(float(post["created_utc"])) for post in saved_posts if post.get("created_utc") is not None]
-                resume = min(timestamps) if timestamps else None
-            print(f"Resuming incomplete metadata fetch from {resume}")
-            crawl(resume, stop_when_caught_up=False, track_checkpoint=True)
+            crawl_source(source, username, progress.get("before"), None, on_history_page)
+            progress["complete"] = True
+            write_json(checkpoint_path, checkpoint)
+
+    errors = []
+    for key, source in SOURCES.items():
+        try:
+            sync(key)
+        except Exception as error:
+            errors.append(f"{source['name']}: {error}")
+            fallback = "; trying the next source" if len(errors) < len(SOURCES) else ""
+            print(f"{source['name']} unavailable ({error}){fallback}", file=sys.stderr)
+            continue
+        if errors:
+            print(f"Post metadata fetched from {source['name']} instead.")
         else:
-            crawl(None, stop_when_caught_up=False, track_checkpoint=True)
-    except Exception as error:
-        return sort_posts(posts_by_id.values()), str(error)
+            print(f"Post metadata is up to date ({source['name']}).")
+        return sort_posts(posts_by_id.values()), None
 
-    return sort_posts(posts_by_id.values()), None
+    return sort_posts(posts_by_id.values()), "; ".join(errors)
 
 
 def safe_name(value: str, limit: int = 70) -> str:
@@ -325,6 +427,8 @@ def extract_media(posts: list[dict]) -> tuple[list[dict], list[dict]]:
                     "extension": ".mp4",
                     "type": "video",
                     "page_url": permalink,
+                    "hls_url": html.unescape(str(reddit_video.get("hls_url") or "")),
+                    "has_audio": reddit_video.get("has_audio"),
                 })
 
             if host == "redgifs.com" and direct not in seen_urls:
@@ -358,14 +462,56 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+class NotMediaError(Exception):
+    """The server answered with something other than a media file, such as an HTML error page."""
+
+
 def download_url(url: str, destination: Path) -> None:
     temporary = destination.with_suffix(destination.suffix + ".part")
     try:
         with request(url) as response, temporary.open("wb") as output:
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            head = response.read(512)
+            # Image and video formats never start with "<" or "{"; pages and JSON errors do
+            if (content_type.startswith("text/") or "html" in content_type or "json" in content_type
+                    or not head or head.lstrip()[:1] in (b"<", b"{")):
+                raise NotMediaError(f"got {content_type or 'an empty response'} instead of media")
+            output.write(head)
             shutil.copyfileobj(response, output)
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def download_reddit_video(item: dict, destination: Path) -> str:
+    """Fetch a Reddit-hosted video straight from v.redd.it, avoiding reddit.com
+    post pages, which now block logged-out downloaders. Returns the URL used."""
+    errors = []
+    ffmpeg = shutil.which("ffmpeg")
+    if item.get("hls_url") and ffmpeg:
+        # The HLS playlist carries both picture and sound; ffmpeg joins them into one mp4
+        temporary = destination.with_name(destination.stem + ".part" + destination.suffix)
+        try:
+            subprocess.run(
+                [ffmpeg, "-v", "error", "-y", "-user_agent", USER_AGENT,
+                 "-i", item["hls_url"], "-c", "copy", str(temporary)],
+                check=True, capture_output=True, timeout=1800,
+            )
+            if temporary.stat().st_size > 0:
+                temporary.replace(destination)
+                return item["hls_url"]
+            errors.append("ffmpeg produced an empty file")
+        except subprocess.CalledProcessError as error:
+            errors.append(f"ffmpeg: {error.stderr.decode(errors='replace').strip()[-300:]}")
+        except Exception as error:
+            errors.append(f"ffmpeg: {error}")
+        finally:
+            temporary.unlink(missing_ok=True)
+    if item.get("has_audio") is False:
+        # No sound track, so the plain video file is the whole thing
+        download_url(item["url"], destination)
+        return item["url"]
+    raise RuntimeError("; ".join(errors) or "no direct video source available")
 
 
 def choose_filename(item: dict) -> str:
@@ -374,9 +520,26 @@ def choose_filename(item: dict) -> str:
     return f"{item['post_id']}_{item['position']:02d}_{token}_{title}{item['extension']}"
 
 
-def download_items(items: list[dict], media_folder: Path, state: dict, state_path: Path) -> int:
+def video_files(media_folder: Path, stem: str) -> list[Path]:
+    """Finished video files for a stem, whatever extension yt-dlp chose.
+
+    Requires the name to be exactly stem + extension, so per-format
+    intermediates left by an unfinished merge (stem.f137.mp4) don't count.
+    """
+    return [
+        path for path in media_folder.glob(stem + ".*")
+        if path.stem == stem and path.suffix.lower() in VIDEO_EXTENSIONS
+        and path.is_file() and path.stat().st_size > 0
+    ]
+
+
+def download_items(items: list[dict], media_folder: Path, state: dict, state_path: Path,
+                   count_failures: bool = True) -> tuple[int, int]:
+    """Download each item once. `count_failures` is False when this run couldn't
+    confirm it was online, so failures don't count towards giving up on an item."""
     yt_dlp = shutil.which("yt-dlp")
     new_downloads = 0
+    failures = 0
 
     for number, item in enumerate(items, 1):
         media_id = str(item.get("media_id") or "")
@@ -394,30 +557,49 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
             continue
 
         if status in DEAD_STATUSES:
-            print(f"[{number}/{len(items)}] Manifest: dead link/404 ({media_id or item['url']}) -> skipped")
+            print(f"[{number}/{len(items)}] Manifest: dead link/unavailable ({media_id or item['url']}) -> skipped")
             continue
 
         destination = media_folder / choose_filename(item)
         record = {**item, "file": destination.name, "status": "pending"}
+        # Whether a failure here says something about the item rather than our connection
+        conclusive = count_failures
 
         try:
+            on_disk = video_files(media_folder, destination.stem) if item["type"] == "video" else []
+            if on_disk:
+                destination = max(on_disk, key=lambda path: path.stat().st_size)
+                record["file"] = destination.name
             if destination.is_file() and destination.stat().st_size > 0:
                 record["status"] = "existing"
                 print(f"[{number}/{len(items)}] existing on disk: {destination.name}")
             elif item["type"] == "video" and item.get("page_url"):
-                if not yt_dlp:
-                    raise RuntimeError("yt-dlp is required for video downloads")
-                stem = destination.with_suffix("")
-                template = str(stem) + ".%(ext)s"
-                subprocess.run(
-                    [yt_dlp, "--no-playlist", "--no-overwrites", "-o", template, item["page_url"]],
-                    check=True,
-                )
-                matches = [path for path in media_folder.glob(stem.name + ".*") if path.suffix != ".part"]
-                if not matches:
-                    raise RuntimeError("yt-dlp completed without producing a file")
-                destination = max(matches, key=lambda path: path.stat().st_size)
-                record["file"] = destination.name
+                errors = []
+                if item.get("hls_url") or item.get("has_audio") is False:
+                    try:
+                        record["downloaded_from"] = download_reddit_video(item, destination)
+                    except Exception as error:
+                        errors.append(f"direct: {error}")
+                if "downloaded_from" not in record:
+                    # Last resort: let yt-dlp work it out from the post page
+                    if not yt_dlp:
+                        conclusive = conclusive and bool(errors)
+                        raise RuntimeError(" | ".join(errors + ["yt-dlp is required for video downloads"]))
+                    stem = destination.with_suffix("")
+                    template = str(stem) + ".%(ext)s"
+                    try:
+                        subprocess.run(
+                            [yt_dlp, "--no-playlist", "--no-overwrites", "-o", template, item["page_url"]],
+                            check=True,
+                        )
+                    except subprocess.CalledProcessError as error:
+                        raise RuntimeError(" | ".join(errors + [f"yt-dlp exited with status {error.returncode}"]))
+                    matches = video_files(media_folder, stem.name)
+                    if not matches:
+                        raise RuntimeError("yt-dlp completed without producing a file")
+                    destination = max(matches, key=lambda path: path.stat().st_size)
+                    record["file"] = destination.name
+                    record["downloaded_from"] = item["page_url"]
                 record["status"] = "downloaded"
                 new_downloads += 1
                 print(f"[{number}/{len(items)}] downloaded: {record['file']}")
@@ -434,6 +616,9 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
                     except urllib.error.HTTPError as error:
                         http_codes.append(error.code)
                         errors.append(f"{candidate}: {error}")
+                    except NotMediaError as error:
+                        http_codes.append("not_media")
+                        errors.append(f"{candidate}: {error}")
                     except Exception as error:
                         http_codes.append(None)
                         errors.append(f"{candidate}: {error}")
@@ -443,6 +628,8 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
                         record["status"] = "failed_404"
                     else:
                         record["status"] = "failed"
+                    if all(code is None for code in http_codes):
+                        conclusive = False
                     raise RuntimeError(" | ".join(errors))
                 print(f"[{number}/{len(items)}] downloaded: {record['file']}")
 
@@ -452,13 +639,18 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
         except Exception as error:
             if record["status"] == "pending":
                 record["status"] = "failed"
+            if record["status"] == "failed":
+                record["attempts"] = int(previous.get("attempts") or 0) + (1 if conclusive else 0)
+                if record["attempts"] >= MAX_DOWNLOAD_ATTEMPTS:
+                    record["status"] = "permanently_unavailable"
             record["error"] = str(error)
+            failures += 1
             print(f"[{number}/{len(items)}] {record['status']}: {record['file']} ({error})", file=sys.stderr)
 
         state[key] = record
         write_json(state_path, state)
 
-    return new_downloads
+    return new_downloads, failures
 
 
 def image_fingerprint(path: Path) -> dict | None:
@@ -486,6 +678,33 @@ def image_fingerprint(path: Path) -> dict | None:
         for column in range(8):
             bits = (bits << 1) | (frame[row * 9 + column] > frame[row * 9 + column + 1])
     return {"width": width, "height": height, "dhash": f"{bits:016x}"}
+
+
+def similar_hash_pairs(hashes: list[int]) -> Iterator[tuple[int, int]]:
+    """Index pairs whose hashes might be within VISUAL_HASH_DISTANCE bits.
+
+    Splits each 64-bit hash into VISUAL_HASH_DISTANCE + 1 bands. Two hashes that
+    differ in at most that many bits must agree exactly on at least one band, so
+    only images sharing a band need comparing instead of every possible pair.
+    Pairs are yielded lazily in (i, j) order, so memory stays linear even when
+    many images share a band.
+    """
+    bands = VISUAL_HASH_DISTANCE + 1
+    edges = [round(64 * band / bands) for band in range(bands + 1)]
+    keys = [
+        [(band, (value >> edges[band]) & ((1 << (edges[band + 1] - edges[band])) - 1)) for band in range(bands)]
+        for value in hashes
+    ]
+    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for index, index_keys in enumerate(keys):
+        for key in index_keys:
+            buckets[key].append(index)
+    for first, index_keys in enumerate(keys):
+        later: set[int] = set()
+        for key in index_keys:
+            later.update(buckets[key])
+        for second in sorted(other for other in later if other > first):
+            yield first, second
 
 
 def remove_duplicate(state: dict, key: str, keeper_key: str, media_folder: Path, status: str) -> None:
@@ -543,7 +762,8 @@ def deduplicate(media_folder: Path, state: dict, state_path: Path) -> int:
         return (record["width"] * record["height"], record.get("bytes") or 0, -oldest_first(key)[0])
 
     deleted: set[str] = set()
-    for first, second in combinations(images, 2):
+    for i, j in similar_hash_pairs([int(state[key]["dhash"], 16) for key in images]):
+        first, second = images[i], images[j]
         if first in deleted or second in deleted:
             continue
         a, b = state[first], state[second]
@@ -575,12 +795,72 @@ def refresh_gallery(media_folder: Path) -> None:
         print(f"Gallery scan error: {error}", file=sys.stderr)
 
 
-def install_self() -> int:
+def install_path() -> Path | None:
     prefix = os.environ.get("PREFIX")
     if not prefix:
         print("PREFIX is not set. Run inside Termux.", file=sys.stderr)
+        return None
+    return Path(prefix) / "bin" / "reddit-archive"
+
+
+def version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", version))
+
+
+def update_self() -> int:
+    """Replace the installed command with the latest version from GitHub."""
+    destination = install_path()
+    if destination is None:
         return 2
-    destination = Path(prefix) / "bin" / "reddit-archive"
+    try:
+        with request(UPDATE_URL, retries=3, timeout=30) as response:
+            source = response.read().decode("utf-8")
+    except Exception as error:
+        print(f"Could not download the update: {error}", file=sys.stderr)
+        return 1
+
+    # Refuse anything that isn't a working copy of this script, so a bad download can't break the install
+    match = re.search(r'^VERSION = "([^"]+)"', source, flags=re.MULTILINE)
+    try:
+        compile(source, UPDATE_URL, "exec")
+    except SyntaxError as error:
+        match = None
+        print(f"Downloaded file is not valid Python ({error}).", file=sys.stderr)
+    if not match or "def main(" not in source:
+        print("Downloaded file is not reddit-archive; installed version left unchanged.", file=sys.stderr)
+        return 1
+
+    latest = match.group(1)
+    if destination.is_file():
+        installed = re.search(r'^VERSION = "([^"]+)"', destination.read_text(encoding="utf-8", errors="replace"), flags=re.MULTILINE)
+        current = installed.group(1) if installed else "unknown"
+        if installed and version_tuple(latest) == version_tuple(current):
+            print(f"Already up to date ({current}).")
+            return 0
+        if installed and version_tuple(latest) < version_tuple(current):
+            print(f"GitHub has {latest}, older than the installed {current}; not downgrading.")
+            return 0
+    else:
+        current = "not installed"
+        if version_tuple(latest) < version_tuple(VERSION):
+            print(f"GitHub has {latest}, older than this copy ({VERSION}); run --install to install this copy instead.")
+            return 0
+
+    temporary = destination.with_name(".reddit-archive.new")
+    try:
+        temporary.write_text(source, encoding="utf-8")
+        temporary.chmod(0o755)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    print(f"Installed reddit-archive {latest}" if current == "not installed" else f"Updated reddit-archive {current} -> {latest}")
+    return 0
+
+
+def install_self() -> int:
+    destination = install_path()
+    if destination is None:
+        return 2
     source = Path(__file__).resolve()
     shutil.copy2(source, destination)
     destination.chmod(0o755)
@@ -592,6 +872,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("username", nargs="?", help="Reddit username without u/")
     parser.add_argument("--install", action="store_true", help="Install as the reddit-archive command")
+    parser.add_argument("--update", action="store_true", help="Install the latest version from GitHub")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument(
         "--manifest-dir",
@@ -610,12 +891,12 @@ def main() -> int:
 
     if args.install:
         return install_self()
+    if args.update:
+        return update_self()
     if not args.username:
         parser.error("username is required")
     if not args.no_dedup and (not shutil.which("ffmpeg") or not shutil.which("ffprobe")):
         parser.error("ffmpeg and ffprobe are required for deduplication (or pass --no-dedup)")
-    if not shutil.which("yt-dlp"):
-        parser.error("yt-dlp is required")
 
     username = re.sub(r"^u/", "", args.username.strip(), flags=re.IGNORECASE)
     if not re.fullmatch(r"[A-Za-z0-9_-]{3,20}", username):
@@ -641,14 +922,18 @@ def main() -> int:
 
     items, warnings = extract_media(posts)
     print(f"Found {len(posts)} total posts and {len(items)} media candidates")
+    if not shutil.which("yt-dlp") and any(item["type"] == "video" for item in items):
+        print("yt-dlp not found: videos will be skipped and retried next run (pip install yt-dlp)", file=sys.stderr)
 
-    new_downloads = download_items(items, media_folder, state, state_path)
+    new_downloads, failures = download_items(items, media_folder, state, state_path, count_failures=not metadata_error)
     write_json(state_path, state)
 
     if new_downloads > 0:
         print(f"\n{new_downloads} new file(s) downloaded.")
-    else:
+    elif not failures:
         print("\nAll media items already accounted for in manifest. Nothing downloaded.")
+    if failures:
+        print(f"\n{failures} item(s) failed this run; see the errors above. Each is retried on later runs, up to {MAX_DOWNLOAD_ATTEMPTS} tries.")
 
     duplicates_removed = 0
     if not args.no_dedup:
@@ -661,6 +946,7 @@ def main() -> int:
     print("\nRun Complete")
     print(f"Clean Media Files:  {len(remaining)}")
     print(f"New Downloads:      {new_downloads}")
+    print(f"Failed:             {failures}")
     print(f"Duplicates Removed: {duplicates_removed}")
     return 4 if metadata_error else 0
 
