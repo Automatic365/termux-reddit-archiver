@@ -20,7 +20,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterator
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 USER_AGENT = f"termux-reddit-archive/{VERSION} (personal archival use)"
 ARCTIC_SEARCH = "https://arctic-shift.photon-reddit.com/api/posts/search"
 PULLPUSH_SEARCH = "https://api.pullpush.io/reddit/search/submission/"
@@ -426,6 +426,8 @@ def extract_media(posts: list[dict]) -> tuple[list[dict], list[dict]]:
                     "extension": ".mp4",
                     "type": "video",
                     "page_url": permalink,
+                    "hls_url": html.unescape(str(reddit_video.get("hls_url") or "")),
+                    "has_audio": reddit_video.get("has_audio"),
                 })
 
             if host == "redgifs.com" and direct not in seen_urls:
@@ -480,6 +482,37 @@ def download_url(url: str, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def download_reddit_video(item: dict, destination: Path) -> str:
+    """Fetch a Reddit-hosted video straight from v.redd.it, avoiding reddit.com
+    post pages, which now block logged-out downloaders. Returns the URL used."""
+    errors = []
+    ffmpeg = shutil.which("ffmpeg")
+    if item.get("hls_url") and ffmpeg:
+        # The HLS playlist carries both picture and sound; ffmpeg joins them into one mp4
+        temporary = destination.with_name(destination.stem + ".part" + destination.suffix)
+        try:
+            subprocess.run(
+                [ffmpeg, "-v", "error", "-y", "-user_agent", USER_AGENT,
+                 "-i", item["hls_url"], "-c", "copy", str(temporary)],
+                check=True, capture_output=True, timeout=1800,
+            )
+            if temporary.stat().st_size > 0:
+                temporary.replace(destination)
+                return item["hls_url"]
+            errors.append("ffmpeg produced an empty file")
+        except subprocess.CalledProcessError as error:
+            errors.append(f"ffmpeg: {error.stderr.decode(errors='replace').strip()[-300:]}")
+        except Exception as error:
+            errors.append(f"ffmpeg: {error}")
+        finally:
+            temporary.unlink(missing_ok=True)
+    if item.get("has_audio") is False:
+        # No sound track, so the plain video file is the whole thing
+        download_url(item["url"], destination)
+        return item["url"]
+    raise RuntimeError("; ".join(errors) or "no direct video source available")
+
+
 def choose_filename(item: dict) -> str:
     token = safe_name(str(item.get("media_id") or "media"), 30)
     title = safe_name(item["title"], 50)
@@ -500,11 +533,12 @@ def video_files(media_folder: Path, stem: str) -> list[Path]:
 
 
 def download_items(items: list[dict], media_folder: Path, state: dict, state_path: Path,
-                   count_failures: bool = True) -> int:
+                   count_failures: bool = True) -> tuple[int, int]:
     """Download each item once. `count_failures` is False when this run couldn't
     confirm it was online, so failures don't count towards giving up on an item."""
     yt_dlp = shutil.which("yt-dlp")
     new_downloads = 0
+    failures = 0
 
     for number, item in enumerate(items, 1):
         media_id = str(item.get("media_id") or "")
@@ -539,20 +573,32 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
                 record["status"] = "existing"
                 print(f"[{number}/{len(items)}] existing on disk: {destination.name}")
             elif item["type"] == "video" and item.get("page_url"):
-                if not yt_dlp:
-                    conclusive = False
-                    raise RuntimeError("yt-dlp is required for video downloads")
-                stem = destination.with_suffix("")
-                template = str(stem) + ".%(ext)s"
-                subprocess.run(
-                    [yt_dlp, "--no-playlist", "--no-overwrites", "-o", template, item["page_url"]],
-                    check=True,
-                )
-                matches = video_files(media_folder, stem.name)
-                if not matches:
-                    raise RuntimeError("yt-dlp completed without producing a file")
-                destination = max(matches, key=lambda path: path.stat().st_size)
-                record["file"] = destination.name
+                errors = []
+                if item.get("hls_url") or item.get("has_audio") is False:
+                    try:
+                        record["downloaded_from"] = download_reddit_video(item, destination)
+                    except Exception as error:
+                        errors.append(f"direct: {error}")
+                if "downloaded_from" not in record:
+                    # Last resort: let yt-dlp work it out from the post page
+                    if not yt_dlp:
+                        conclusive = conclusive and bool(errors)
+                        raise RuntimeError(" | ".join(errors + ["yt-dlp is required for video downloads"]))
+                    stem = destination.with_suffix("")
+                    template = str(stem) + ".%(ext)s"
+                    try:
+                        subprocess.run(
+                            [yt_dlp, "--no-playlist", "--no-overwrites", "-o", template, item["page_url"]],
+                            check=True,
+                        )
+                    except subprocess.CalledProcessError as error:
+                        raise RuntimeError(" | ".join(errors + [f"yt-dlp exited with status {error.returncode}"]))
+                    matches = video_files(media_folder, stem.name)
+                    if not matches:
+                        raise RuntimeError("yt-dlp completed without producing a file")
+                    destination = max(matches, key=lambda path: path.stat().st_size)
+                    record["file"] = destination.name
+                    record["downloaded_from"] = item["page_url"]
                 record["status"] = "downloaded"
                 new_downloads += 1
                 print(f"[{number}/{len(items)}] downloaded: {record['file']}")
@@ -597,12 +643,13 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
                 if record["attempts"] >= MAX_DOWNLOAD_ATTEMPTS:
                     record["status"] = "permanently_unavailable"
             record["error"] = str(error)
+            failures += 1
             print(f"[{number}/{len(items)}] {record['status']}: {record['file']} ({error})", file=sys.stderr)
 
         state[key] = record
         write_json(state_path, state)
 
-    return new_downloads
+    return new_downloads, failures
 
 
 def image_fingerprint(path: Path) -> dict | None:
@@ -814,13 +861,15 @@ def main() -> int:
     if not shutil.which("yt-dlp") and any(item["type"] == "video" for item in items):
         print("yt-dlp not found: videos will be skipped and retried next run (pip install yt-dlp)", file=sys.stderr)
 
-    new_downloads = download_items(items, media_folder, state, state_path, count_failures=not metadata_error)
+    new_downloads, failures = download_items(items, media_folder, state, state_path, count_failures=not metadata_error)
     write_json(state_path, state)
 
     if new_downloads > 0:
         print(f"\n{new_downloads} new file(s) downloaded.")
-    else:
+    elif not failures:
         print("\nAll media items already accounted for in manifest. Nothing downloaded.")
+    if failures:
+        print(f"\n{failures} item(s) failed this run; see the errors above. Each is retried on later runs, up to {MAX_DOWNLOAD_ATTEMPTS} tries.")
 
     duplicates_removed = 0
     if not args.no_dedup:
@@ -833,6 +882,7 @@ def main() -> int:
     print("\nRun Complete")
     print(f"Clean Media Files:  {len(remaining)}")
     print(f"New Downloads:      {new_downloads}")
+    print(f"Failed:             {failures}")
     print(f"Duplicates Removed: {duplicates_removed}")
     return 4 if metadata_error else 0
 
