@@ -20,7 +20,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterator
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 USER_AGENT = f"termux-reddit-archive/{VERSION} (personal archival use)"
 ARCTIC_SEARCH = "https://arctic-shift.photon-reddit.com/api/posts/search"
 PULLPUSH_SEARCH = "https://api.pullpush.io/reddit/search/submission/"
@@ -62,6 +62,13 @@ MIME_EXTENSIONS = {
 # HTTP codes that mean the media is gone for good, not temporarily unavailable.
 GONE_HTTP_CODES = {404, 410}
 
+# Give up on an item after this many failed runs (connection problems don't count).
+MAX_DOWNLOAD_ATTEMPTS = 5
+
+# Post metadata requests fail fast so a hanging source quickly hands over to the next one.
+METADATA_TIMEOUT = 30
+METADATA_RETRIES = 3
+
 ARCHIVED_STATUSES = {"downloaded", "existing"}
 DUPLICATE_STATUSES = {"deleted_exact_duplicate", "deleted_visual_duplicate"}
 DEAD_STATUSES = {"failed_404", "permanently_unavailable"}
@@ -98,11 +105,11 @@ def rate_limit_delay(error: urllib.error.HTTPError, default: float = 30) -> floa
     return default
 
 
-def request(url: str, retries: int = 5):
+def request(url: str, retries: int = 5, timeout: float = 60):
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            return urllib.request.urlopen(req, timeout=60)
+            return urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as error:
             if error.code == 429 and attempt < retries - 1:
                 delay = rate_limit_delay(error)
@@ -125,7 +132,7 @@ def request(url: str, retries: int = 5):
 
 
 def request_json(url: str):
-    with request(url) as response:
+    with request(url, retries=METADATA_RETRIES, timeout=METADATA_TIMEOUT) as response:
         return json.load(response)
 
 
@@ -452,10 +459,21 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+class NotMediaError(Exception):
+    """The server answered with something other than a media file, such as an HTML error page."""
+
+
 def download_url(url: str, destination: Path) -> None:
     temporary = destination.with_suffix(destination.suffix + ".part")
     try:
         with request(url) as response, temporary.open("wb") as output:
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            head = response.read(512)
+            # Image and video formats never start with "<" or "{"; pages and JSON errors do
+            if (content_type.startswith("text/") or "html" in content_type or "json" in content_type
+                    or not head or head.lstrip()[:1] in (b"<", b"{")):
+                raise NotMediaError(f"got {content_type or 'an empty response'} instead of media")
+            output.write(head)
             shutil.copyfileobj(response, output)
         temporary.replace(destination)
     finally:
@@ -481,7 +499,10 @@ def video_files(media_folder: Path, stem: str) -> list[Path]:
     ]
 
 
-def download_items(items: list[dict], media_folder: Path, state: dict, state_path: Path) -> int:
+def download_items(items: list[dict], media_folder: Path, state: dict, state_path: Path,
+                   count_failures: bool = True) -> int:
+    """Download each item once. `count_failures` is False when this run couldn't
+    confirm it was online, so failures don't count towards giving up on an item."""
     yt_dlp = shutil.which("yt-dlp")
     new_downloads = 0
 
@@ -501,11 +522,13 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
             continue
 
         if status in DEAD_STATUSES:
-            print(f"[{number}/{len(items)}] Manifest: dead link/404 ({media_id or item['url']}) -> skipped")
+            print(f"[{number}/{len(items)}] Manifest: dead link/unavailable ({media_id or item['url']}) -> skipped")
             continue
 
         destination = media_folder / choose_filename(item)
         record = {**item, "file": destination.name, "status": "pending"}
+        # Whether a failure here says something about the item rather than our connection
+        conclusive = count_failures
 
         try:
             on_disk = video_files(media_folder, destination.stem) if item["type"] == "video" else []
@@ -517,6 +540,7 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
                 print(f"[{number}/{len(items)}] existing on disk: {destination.name}")
             elif item["type"] == "video" and item.get("page_url"):
                 if not yt_dlp:
+                    conclusive = False
                     raise RuntimeError("yt-dlp is required for video downloads")
                 stem = destination.with_suffix("")
                 template = str(stem) + ".%(ext)s"
@@ -545,6 +569,9 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
                     except urllib.error.HTTPError as error:
                         http_codes.append(error.code)
                         errors.append(f"{candidate}: {error}")
+                    except NotMediaError as error:
+                        http_codes.append("not_media")
+                        errors.append(f"{candidate}: {error}")
                     except Exception as error:
                         http_codes.append(None)
                         errors.append(f"{candidate}: {error}")
@@ -554,6 +581,8 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
                         record["status"] = "failed_404"
                     else:
                         record["status"] = "failed"
+                    if all(code is None for code in http_codes):
+                        conclusive = False
                     raise RuntimeError(" | ".join(errors))
                 print(f"[{number}/{len(items)}] downloaded: {record['file']}")
 
@@ -563,6 +592,10 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
         except Exception as error:
             if record["status"] == "pending":
                 record["status"] = "failed"
+            if record["status"] == "failed":
+                record["attempts"] = int(previous.get("attempts") or 0) + (1 if conclusive else 0)
+                if record["attempts"] >= MAX_DOWNLOAD_ATTEMPTS:
+                    record["status"] = "permanently_unavailable"
             record["error"] = str(error)
             print(f"[{number}/{len(items)}] {record['status']}: {record['file']} ({error})", file=sys.stderr)
 
@@ -781,7 +814,7 @@ def main() -> int:
     if not shutil.which("yt-dlp") and any(item["type"] == "video" for item in items):
         print("yt-dlp not found: videos will be skipped and retried next run (pip install yt-dlp)", file=sys.stderr)
 
-    new_downloads = download_items(items, media_folder, state, state_path)
+    new_downloads = download_items(items, media_folder, state, state_path, count_failures=not metadata_error)
     write_json(state_path, state)
 
     if new_downloads > 0:
