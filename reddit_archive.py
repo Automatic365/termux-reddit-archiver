@@ -20,7 +20,7 @@ from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 USER_AGENT = f"termux-reddit-archive/{VERSION} (personal archival use)"
 ARCTIC_SEARCH = "https://arctic-shift.photon-reddit.com/api/posts/search"
 
@@ -68,6 +68,16 @@ def read_json(path: Path, default):
         return default
 
 
+def rate_limit_delay(error: urllib.error.HTTPError, default: float = 30) -> float:
+    """Seconds to wait after a 429; tolerates missing, decimal or date-valued headers."""
+    for header in ("Retry-After", "X-RateLimit-Reset"):
+        try:
+            return float(error.headers.get(header))
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
 def request(url: str, retries: int = 5):
     for attempt in range(retries):
         try:
@@ -75,8 +85,8 @@ def request(url: str, retries: int = 5):
             return urllib.request.urlopen(req, timeout=60)
         except urllib.error.HTTPError as error:
             if error.code == 429 and attempt < retries - 1:
-                delay = int(error.headers.get("X-RateLimit-Reset", "30") or 30)
-                print(f"Rate limited; waiting {delay} seconds", file=sys.stderr)
+                delay = rate_limit_delay(error)
+                print(f"Rate limited; waiting {delay:g} seconds", file=sys.stderr)
                 time.sleep(min(max(delay, 1), 300))
                 continue
             if error.code == 422 and attempt < retries - 1:
@@ -374,6 +384,14 @@ def choose_filename(item: dict) -> str:
     return f"{item['post_id']}_{item['position']:02d}_{token}_{title}{item['extension']}"
 
 
+def video_files(media_folder: Path, stem: str) -> list[Path]:
+    """Finished video files for a stem, whatever extension yt-dlp chose."""
+    return [
+        path for path in media_folder.glob(stem + ".*")
+        if path.suffix.lower() in VIDEO_EXTENSIONS and path.is_file() and path.stat().st_size > 0
+    ]
+
+
 def download_items(items: list[dict], media_folder: Path, state: dict, state_path: Path) -> int:
     yt_dlp = shutil.which("yt-dlp")
     new_downloads = 0
@@ -401,6 +419,10 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
         record = {**item, "file": destination.name, "status": "pending"}
 
         try:
+            on_disk = video_files(media_folder, destination.stem) if item["type"] == "video" else []
+            if on_disk:
+                destination = max(on_disk, key=lambda path: path.stat().st_size)
+                record["file"] = destination.name
             if destination.is_file() and destination.stat().st_size > 0:
                 record["status"] = "existing"
                 print(f"[{number}/{len(items)}] existing on disk: {destination.name}")
@@ -413,7 +435,7 @@ def download_items(items: list[dict], media_folder: Path, state: dict, state_pat
                     [yt_dlp, "--no-playlist", "--no-overwrites", "-o", template, item["page_url"]],
                     check=True,
                 )
-                matches = [path for path in media_folder.glob(stem.name + ".*") if path.suffix != ".part"]
+                matches = video_files(media_folder, stem.name)
                 if not matches:
                     raise RuntimeError("yt-dlp completed without producing a file")
                 destination = max(matches, key=lambda path: path.stat().st_size)
@@ -488,6 +510,26 @@ def image_fingerprint(path: Path) -> dict | None:
     return {"width": width, "height": height, "dhash": f"{bits:016x}"}
 
 
+def similar_hash_pairs(hashes: list[int]) -> list[tuple[int, int]]:
+    """Index pairs whose hashes might be within VISUAL_HASH_DISTANCE bits.
+
+    Splits each 64-bit hash into VISUAL_HASH_DISTANCE + 1 bands. Two hashes that
+    differ in at most that many bits must agree exactly on at least one band, so
+    only images sharing a band need comparing instead of every possible pair.
+    """
+    bands = VISUAL_HASH_DISTANCE + 1
+    edges = [round(64 * band / bands) for band in range(bands + 1)]
+    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for index, value in enumerate(hashes):
+        for band in range(bands):
+            low, high = edges[band], edges[band + 1]
+            buckets[(band, (value >> low) & ((1 << (high - low)) - 1))].append(index)
+    pairs: set[tuple[int, int]] = set()
+    for members in buckets.values():
+        pairs.update(combinations(members, 2))
+    return sorted(pairs)
+
+
 def remove_duplicate(state: dict, key: str, keeper_key: str, media_folder: Path, status: str) -> None:
     record = state[key]
     (media_folder / record["file"]).unlink(missing_ok=True)
@@ -543,7 +585,8 @@ def deduplicate(media_folder: Path, state: dict, state_path: Path) -> int:
         return (record["width"] * record["height"], record.get("bytes") or 0, -oldest_first(key)[0])
 
     deleted: set[str] = set()
-    for first, second in combinations(images, 2):
+    for i, j in similar_hash_pairs([int(state[key]["dhash"], 16) for key in images]):
+        first, second = images[i], images[j]
         if first in deleted or second in deleted:
             continue
         a, b = state[first], state[second]
@@ -614,8 +657,6 @@ def main() -> int:
         parser.error("username is required")
     if not args.no_dedup and (not shutil.which("ffmpeg") or not shutil.which("ffprobe")):
         parser.error("ffmpeg and ffprobe are required for deduplication (or pass --no-dedup)")
-    if not shutil.which("yt-dlp"):
-        parser.error("yt-dlp is required")
 
     username = re.sub(r"^u/", "", args.username.strip(), flags=re.IGNORECASE)
     if not re.fullmatch(r"[A-Za-z0-9_-]{3,20}", username):
@@ -641,6 +682,8 @@ def main() -> int:
 
     items, warnings = extract_media(posts)
     print(f"Found {len(posts)} total posts and {len(items)} media candidates")
+    if not shutil.which("yt-dlp") and any(item["type"] == "video" for item in items):
+        print("yt-dlp not found: videos will be skipped and retried next run (pip install yt-dlp)", file=sys.stderr)
 
     new_downloads = download_items(items, media_folder, state, state_path)
     write_json(state_path, state)
