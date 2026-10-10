@@ -20,9 +20,29 @@ from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 USER_AGENT = f"termux-reddit-archive/{VERSION} (personal archival use)"
 ARCTIC_SEARCH = "https://arctic-shift.photon-reddit.com/api/posts/search"
+PULLPUSH_SEARCH = "https://api.pullpush.io/reddit/search/submission/"
+
+# Metadata sources in order of preference; later ones are only used when earlier ones fail.
+SOURCES = {
+    "arctic_shift": {
+        "name": "Arctic Shift",
+        "url": ARCTIC_SEARCH,
+        "params": {"sort": "desc", "limit": "100"},
+        "page_delay": 1,
+    },
+    "pullpush": {
+        "name": "PullPush",
+        "url": PULLPUSH_SEARCH,
+        "params": {"sort": "desc", "sort_type": "created_utc", "size": "100"},
+        "page_delay": 4,  # PullPush rate limits at roughly 15 requests per minute
+    },
+}
+
+# Re-check this far behind the newest known post, to catch posts archived late.
+INCREMENTAL_OVERLAP = 3 * 24 * 60 * 60
 
 DEFAULT_MANIFEST_ROOT = Path("/storage/emulated/0/Download/reddit_manifests")
 DEFAULT_MEDIA_ROOT = Path("/storage/emulated/0")
@@ -136,6 +156,29 @@ def sort_posts(posts) -> list[dict]:
     )
 
 
+def created(post: dict) -> int | None:
+    value = post.get("created_utc")
+    return int(float(value)) if value is not None else None
+
+
+def load_checkpoint(path: Path, saved_posts: list[dict]) -> dict:
+    """Per-source crawl state, upgrading the single-source format from v1.7 and earlier."""
+    checkpoint = read_json(path, {})
+    if not isinstance(checkpoint, dict):
+        return {}
+    if "complete" in checkpoint or "before" in checkpoint:
+        timestamps = [ts for ts in map(created, saved_posts) if ts is not None]
+        before = checkpoint.get("before")
+        if before is None and not checkpoint.get("complete") and timestamps:
+            before = min(timestamps)
+        checkpoint = {"arctic_shift": {
+            "complete": bool(checkpoint.get("complete")),
+            "before": before,
+            "newest": max(timestamps) if timestamps else None,
+        }}
+    return {key: value for key, value in checkpoint.items() if key in SOURCES and isinstance(value, dict)}
+
+
 def inspect_manifest_history(manifest_dir: Path) -> dict:
     state_file = manifest_dir / "state.json"
     posts_file = manifest_dir / "posts.json"
@@ -143,7 +186,7 @@ def inspect_manifest_history(manifest_dir: Path) -> dict:
 
     saved_posts = load_saved_posts(posts_file)
     state = read_json(state_file, {})
-    checkpoint = read_json(checkpoint_file, {})
+    checkpoint = load_checkpoint(checkpoint_file, saved_posts)
 
     print(f"--- Manifest Check: {manifest_dir.name} ---")
     if not manifest_dir.exists() or (not state and not saved_posts):
@@ -160,9 +203,58 @@ def inspect_manifest_history(manifest_dir: Path) -> dict:
         print(f"  - Duplicates:     {duplicates}")
         print(f"  - Dead/404s:      {dead}")
         print(f"  - Transient fail: {failed}")
-        print(f"Metadata Status:    {'Complete' if checkpoint.get('complete') else 'Partial/In-progress'}")
+        for key, source in SOURCES.items():
+            if key in checkpoint:
+                status = "Complete" if checkpoint[key].get("complete") else "Partial/In-progress"
+            else:
+                status = "Not used yet"
+            print(f"{source['name'] + ':':<20}{status}")
     print("----------------------------------------\n")
     return state
+
+
+def merge_post(existing: dict | None, incoming: dict) -> dict:
+    """Keep what we already have, filling in any fields the earlier copy was missing."""
+    if not existing:
+        return incoming
+    merged = dict(incoming)
+    merged.update({key: value for key, value in existing.items() if value not in (None, "", [], {})})
+    return merged
+
+
+def crawl_source(source: dict, username: str, before: int | None, stop_at: int | None, on_page) -> None:
+    """Page backwards from `before` until history ends or posts reach `stop_at`.
+
+    Raises on request errors and malformed pages, so an outage is never
+    mistaken for the end of a user's history.
+    """
+    seen: set[str] = set()
+    while True:
+        query = {"author": username, **source["params"]}
+        if before is not None:
+            query["before"] = str(before)
+        batch = normalize_post_response(request_json(source["url"] + "?" + urllib.parse.urlencode(query)))
+        if not batch:
+            return
+        timestamps = [ts for ts in map(created, batch) if ts is not None]
+        if not timestamps:
+            raise ValueError(f"{source['name']} returned posts without timestamps")
+
+        ids = {str(post.get("id") or "") for post in batch} - {""}
+        fresh = ids - seen
+        seen |= ids
+        oldest = min(timestamps)
+        # Overlap by one second so posts sharing the boundary timestamp are not
+        # skipped, but always move strictly backwards so paging terminates.
+        cursor = oldest + 1 if fresh else oldest
+        if before is not None:
+            cursor = min(cursor, before - 1)
+        on_page(batch, cursor, max(timestamps))
+
+        if stop_at is not None and oldest <= stop_at:
+            return
+        before = cursor
+        time.sleep(source["page_delay"])
 
 
 def fetch_all_posts(username: str, destination: Path) -> tuple[list[dict], str | None]:
@@ -171,70 +263,62 @@ def fetch_all_posts(username: str, destination: Path) -> tuple[list[dict], str |
         str(post["id"]): post for post in saved_posts if post.get("id")
     }
     checkpoint_path = destination.with_name("metadata_checkpoint.json")
-    checkpoint = read_json(checkpoint_path, {})
-    if not isinstance(checkpoint, dict):
-        checkpoint = {}
+    checkpoint = load_checkpoint(checkpoint_path, saved_posts)
 
-    def crawl(before: int | None, stop_when_caught_up: bool, track_checkpoint: bool) -> None:
-        """Page backwards from `before`. Raises on request errors."""
-        while True:
-            query = {"author": username, "sort": "desc", "limit": "100"}
-            if before is not None:
-                query["before"] = str(before)
-            batch = normalize_post_response(request_json(ARCTIC_SEARCH + "?" + urllib.parse.urlencode(query)))
+    def save_batch(batch: list[dict]) -> None:
+        for post in batch:
+            post_id = str(post.get("id") or "")
+            if post_id:
+                posts_by_id[post_id] = merge_post(posts_by_id.get(post_id), post)
+        write_json(destination, sort_posts(posts_by_id.values()))
 
-            if not batch:
-                if track_checkpoint:
-                    write_json(checkpoint_path, {"complete": True, "before": before, "posts_saved": len(posts_by_id)})
-                return
+    def sync(key: str) -> None:
+        source = SOURCES[key]
+        progress = checkpoint.setdefault(key, {})
 
-            new_posts_found = 0
-            for post in batch:
-                post_id = str(post.get("id") or "")
-                if not post_id:
-                    continue
-                if post_id not in posts_by_id:
-                    new_posts_found += 1
-                posts_by_id[post_id] = post
-            write_json(destination, sort_posts(posts_by_id.values()))
+        if progress.get("newest") is not None:
+            # Pick up anything posted since this source's last successful run
+            newest = progress["newest"]
 
-            timestamps = [int(float(item["created_utc"])) for item in batch if item.get("created_utc") is not None]
-            if not timestamps:
-                return
-            oldest = min(timestamps)
-            if before is not None and oldest >= before:
-                return
-            before = oldest
+            def on_new_page(batch, cursor, page_newest):
+                nonlocal newest
+                save_batch(batch)
+                newest = max(newest, page_newest)
 
-            if track_checkpoint:
-                write_json(checkpoint_path, {"complete": False, "before": before, "posts_saved": len(posts_by_id)})
+            crawl_source(source, username, None, progress["newest"] - INCREMENTAL_OVERLAP, on_new_page)
+            progress["newest"] = newest
+            write_json(checkpoint_path, checkpoint)
 
-            # Reached posts we already have: everything newer has been collected
-            if stop_when_caught_up and new_posts_found == 0:
-                return
-            time.sleep(1)
+        if not progress.get("complete"):
+            if progress.get("before") is not None:
+                print(f"Resuming incomplete {source['name']} metadata fetch from {progress['before']}")
 
-    try:
-        if posts_by_id:
-            # Pick up anything posted since the last run
-            crawl(None, stop_when_caught_up=True, track_checkpoint=False)
-            if checkpoint.get("complete"):
-                print("Upstream post archive is up to date.")
-                return sort_posts(posts_by_id.values()), None
+            def on_history_page(batch, cursor, page_newest):
+                save_batch(batch)
+                progress["before"] = cursor
+                progress["newest"] = max(progress.get("newest") or page_newest, page_newest)
+                write_json(checkpoint_path, checkpoint)
 
-            # A previous metadata fetch stopped early; resume where it left off
-            resume = checkpoint.get("before")
-            if resume is None:
-                timestamps = [int(float(post["created_utc"])) for post in saved_posts if post.get("created_utc") is not None]
-                resume = min(timestamps) if timestamps else None
-            print(f"Resuming incomplete metadata fetch from {resume}")
-            crawl(resume, stop_when_caught_up=False, track_checkpoint=True)
+            crawl_source(source, username, progress.get("before"), None, on_history_page)
+            progress["complete"] = True
+            write_json(checkpoint_path, checkpoint)
+
+    errors = []
+    for key, source in SOURCES.items():
+        try:
+            sync(key)
+        except Exception as error:
+            errors.append(f"{source['name']}: {error}")
+            fallback = "; trying the next source" if len(errors) < len(SOURCES) else ""
+            print(f"{source['name']} unavailable ({error}){fallback}", file=sys.stderr)
+            continue
+        if errors:
+            print(f"Post metadata fetched from {source['name']} instead.")
         else:
-            crawl(None, stop_when_caught_up=False, track_checkpoint=True)
-    except Exception as error:
-        return sort_posts(posts_by_id.values()), str(error)
+            print(f"Post metadata is up to date ({source['name']}).")
+        return sort_posts(posts_by_id.values()), None
 
-    return sort_posts(posts_by_id.values()), None
+    return sort_posts(posts_by_id.values()), "; ".join(errors)
 
 
 def safe_name(value: str, limit: int = 70) -> str:
