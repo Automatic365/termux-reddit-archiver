@@ -20,10 +20,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterator
 
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 USER_AGENT = f"termux-reddit-archive/{VERSION} (personal archival use)"
 ARCTIC_SEARCH = "https://arctic-shift.photon-reddit.com/api/posts/search"
 PULLPUSH_SEARCH = "https://api.pullpush.io/reddit/search/submission/"
+UPDATE_URL = "https://raw.githubusercontent.com/Automatic365/termux-reddit-archiver/main/reddit_archive.py"
 
 # Metadata sources in order of preference; later ones are only used when earlier ones fail.
 SOURCES = {
@@ -794,12 +795,72 @@ def refresh_gallery(media_folder: Path) -> None:
         print(f"Gallery scan error: {error}", file=sys.stderr)
 
 
-def install_self() -> int:
+def install_path() -> Path | None:
     prefix = os.environ.get("PREFIX")
     if not prefix:
         print("PREFIX is not set. Run inside Termux.", file=sys.stderr)
+        return None
+    return Path(prefix) / "bin" / "reddit-archive"
+
+
+def version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", version))
+
+
+def update_self() -> int:
+    """Replace the installed command with the latest version from GitHub."""
+    destination = install_path()
+    if destination is None:
         return 2
-    destination = Path(prefix) / "bin" / "reddit-archive"
+    try:
+        with request(UPDATE_URL, retries=3, timeout=30) as response:
+            source = response.read().decode("utf-8")
+    except Exception as error:
+        print(f"Could not download the update: {error}", file=sys.stderr)
+        return 1
+
+    # Refuse anything that isn't a working copy of this script, so a bad download can't break the install
+    match = re.search(r'^VERSION = "([^"]+)"', source, flags=re.MULTILINE)
+    try:
+        compile(source, UPDATE_URL, "exec")
+    except SyntaxError as error:
+        match = None
+        print(f"Downloaded file is not valid Python ({error}).", file=sys.stderr)
+    if not match or "def main(" not in source:
+        print("Downloaded file is not reddit-archive; installed version left unchanged.", file=sys.stderr)
+        return 1
+
+    latest = match.group(1)
+    if destination.is_file():
+        installed = re.search(r'^VERSION = "([^"]+)"', destination.read_text(encoding="utf-8", errors="replace"), flags=re.MULTILINE)
+        current = installed.group(1) if installed else "unknown"
+        if installed and version_tuple(latest) == version_tuple(current):
+            print(f"Already up to date ({current}).")
+            return 0
+        if installed and version_tuple(latest) < version_tuple(current):
+            print(f"GitHub has {latest}, older than the installed {current}; not downgrading.")
+            return 0
+    else:
+        current = "not installed"
+        if version_tuple(latest) < version_tuple(VERSION):
+            print(f"GitHub has {latest}, older than this copy ({VERSION}); run --install to install this copy instead.")
+            return 0
+
+    temporary = destination.with_name(".reddit-archive.new")
+    try:
+        temporary.write_text(source, encoding="utf-8")
+        temporary.chmod(0o755)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    print(f"Installed reddit-archive {latest}" if current == "not installed" else f"Updated reddit-archive {current} -> {latest}")
+    return 0
+
+
+def install_self() -> int:
+    destination = install_path()
+    if destination is None:
+        return 2
     source = Path(__file__).resolve()
     shutil.copy2(source, destination)
     destination.chmod(0o755)
@@ -811,6 +872,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("username", nargs="?", help="Reddit username without u/")
     parser.add_argument("--install", action="store_true", help="Install as the reddit-archive command")
+    parser.add_argument("--update", action="store_true", help="Install the latest version from GitHub")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument(
         "--manifest-dir",
@@ -829,6 +891,8 @@ def main() -> int:
 
     if args.install:
         return install_self()
+    if args.update:
+        return update_self()
     if not args.username:
         parser.error("username is required")
     if not args.no_dedup and (not shutil.which("ffmpeg") or not shutil.which("ffprobe")):
