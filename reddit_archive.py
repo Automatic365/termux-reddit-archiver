@@ -17,8 +17,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from itertools import combinations
 from pathlib import Path
+from typing import Iterator
 
 VERSION = "1.8.0"
 USER_AGENT = f"termux-reddit-archive/{VERSION} (personal archival use)"
@@ -469,10 +469,15 @@ def choose_filename(item: dict) -> str:
 
 
 def video_files(media_folder: Path, stem: str) -> list[Path]:
-    """Finished video files for a stem, whatever extension yt-dlp chose."""
+    """Finished video files for a stem, whatever extension yt-dlp chose.
+
+    Requires the name to be exactly stem + extension, so per-format
+    intermediates left by an unfinished merge (stem.f137.mp4) don't count.
+    """
     return [
         path for path in media_folder.glob(stem + ".*")
-        if path.suffix.lower() in VIDEO_EXTENSIONS and path.is_file() and path.stat().st_size > 0
+        if path.stem == stem and path.suffix.lower() in VIDEO_EXTENSIONS
+        and path.is_file() and path.stat().st_size > 0
     ]
 
 
@@ -594,24 +599,31 @@ def image_fingerprint(path: Path) -> dict | None:
     return {"width": width, "height": height, "dhash": f"{bits:016x}"}
 
 
-def similar_hash_pairs(hashes: list[int]) -> list[tuple[int, int]]:
+def similar_hash_pairs(hashes: list[int]) -> Iterator[tuple[int, int]]:
     """Index pairs whose hashes might be within VISUAL_HASH_DISTANCE bits.
 
     Splits each 64-bit hash into VISUAL_HASH_DISTANCE + 1 bands. Two hashes that
     differ in at most that many bits must agree exactly on at least one band, so
     only images sharing a band need comparing instead of every possible pair.
+    Pairs are yielded lazily in (i, j) order, so memory stays linear even when
+    many images share a band.
     """
     bands = VISUAL_HASH_DISTANCE + 1
     edges = [round(64 * band / bands) for band in range(bands + 1)]
+    keys = [
+        [(band, (value >> edges[band]) & ((1 << (edges[band + 1] - edges[band])) - 1)) for band in range(bands)]
+        for value in hashes
+    ]
     buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for index, value in enumerate(hashes):
-        for band in range(bands):
-            low, high = edges[band], edges[band + 1]
-            buckets[(band, (value >> low) & ((1 << (high - low)) - 1))].append(index)
-    pairs: set[tuple[int, int]] = set()
-    for members in buckets.values():
-        pairs.update(combinations(members, 2))
-    return sorted(pairs)
+    for index, index_keys in enumerate(keys):
+        for key in index_keys:
+            buckets[key].append(index)
+    for first, index_keys in enumerate(keys):
+        later: set[int] = set()
+        for key in index_keys:
+            later.update(buckets[key])
+        for second in sorted(other for other in later if other > first):
+            yield first, second
 
 
 def remove_duplicate(state: dict, key: str, keeper_key: str, media_folder: Path, status: str) -> None:
