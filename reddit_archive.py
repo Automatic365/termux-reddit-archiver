@@ -20,7 +20,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterator
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 USER_AGENT = f"termux-reddit-archive/{VERSION} (personal archival use)"
 ARCTIC_SEARCH = "https://arctic-shift.photon-reddit.com/api/posts/search"
 PULLPUSH_SEARCH = "https://api.pullpush.io/reddit/search/submission/"
@@ -231,7 +231,8 @@ def merge_post(existing: dict | None, incoming: dict) -> dict:
 
 
 def crawl_source(source: dict, username: str, before: int | None, stop_at: int | None, on_page) -> None:
-    """Page backwards from `before` until history ends or posts reach `stop_at`.
+    """Page backwards from `before` until history ends, posts reach `stop_at`,
+    or `on_page` returns True.
 
     Raises on request errors and malformed pages, so an outage is never
     mistaken for the end of a user's history.
@@ -257,15 +258,26 @@ def crawl_source(source: dict, username: str, before: int | None, stop_at: int |
         cursor = oldest + 1 if fresh else oldest
         if before is not None:
             cursor = min(cursor, before - 1)
-        on_page(batch, cursor, max(timestamps))
-
+        if on_page(batch, cursor, max(timestamps)):
+            return
         if stop_at is not None and oldest <= stop_at:
             return
         before = cursor
         time.sleep(source["page_delay"])
 
 
-def fetch_all_posts(username: str, destination: Path) -> tuple[list[dict], str | None]:
+def has_media(post: dict) -> bool:
+    return bool(extract_media([post])[0])
+
+
+def newest_media_posts(posts: list[dict], count: int) -> list[dict]:
+    return [post for post in sort_posts(posts) if has_media(post)][:count]
+
+
+def fetch_all_posts(username: str, destination: Path, max_posts: int | None = None) -> tuple[list[dict], str | None]:
+    """Fetch post metadata, falling back through SOURCES. With `max_posts`, only
+    page back far enough to find that many posts with media, and leave the
+    checkpoint alone so a later full run still collects the whole history."""
     saved_posts = load_saved_posts(destination)
     posts_by_id: dict[str, dict] = {
         str(post["id"]): post for post in saved_posts if post.get("id")
@@ -311,10 +323,23 @@ def fetch_all_posts(username: str, destination: Path) -> tuple[list[dict], str |
             progress["complete"] = True
             write_json(checkpoint_path, checkpoint)
 
+    def sync_newest(key: str) -> None:
+        with_media: set[str] = set()
+
+        def on_page(batch, cursor, page_newest):
+            save_batch(batch)
+            with_media.update(str(post.get("id")) for post in batch if post.get("id") and has_media(post))
+            return len(with_media) >= max_posts
+
+        crawl_source(SOURCES[key], username, None, None, on_page)
+
     errors = []
     for key, source in SOURCES.items():
         try:
-            sync(key)
+            if max_posts:
+                sync_newest(key)
+            else:
+                sync(key)
         except Exception as error:
             errors.append(f"{source['name']}: {error}")
             fallback = "; trying the next source" if len(errors) < len(SOURCES) else ""
@@ -887,6 +912,12 @@ def main() -> int:
         help="Parent directory for media folder (default: /storage/emulated/0)",
     )
     parser.add_argument("--no-dedup", action="store_true", help="Keep duplicate files instead of deleting them")
+    parser.add_argument(
+        "--max-posts",
+        type=int,
+        metavar="N",
+        help="Only archive the N newest posts that have media (default: all)",
+    )
     args = parser.parse_args()
 
     if args.install:
@@ -895,6 +926,8 @@ def main() -> int:
         return update_self()
     if not args.username:
         parser.error("username is required")
+    if args.max_posts is not None and args.max_posts < 1:
+        parser.error("--max-posts must be 1 or more")
     if not args.no_dedup and (not shutil.which("ffmpeg") or not shutil.which("ffprobe")):
         parser.error("ffmpeg and ffprobe are required for deduplication (or pass --no-dedup)")
 
@@ -915,13 +948,21 @@ def main() -> int:
     print(f"Media Output:     {media_folder}")
     print(f"Manifest Records: {user_manifest_dir}\n")
 
-    print("Fetching complete public post metadata...")
-    posts, metadata_error = fetch_all_posts(username, posts_path)
+    if args.max_posts:
+        print(f"Fetching the {args.max_posts} newest posts with media...")
+    else:
+        print("Fetching complete public post metadata...")
+    posts, metadata_error = fetch_all_posts(username, posts_path, args.max_posts)
     if metadata_error:
         print(f"Metadata fetch stopped early ({metadata_error}); it will resume next run.", file=sys.stderr)
 
+    if args.max_posts:
+        posts = newest_media_posts(posts, args.max_posts)
     items, warnings = extract_media(posts)
-    print(f"Found {len(posts)} total posts and {len(items)} media candidates")
+    if args.max_posts:
+        print(f"Limited to the {len(posts)} newest posts with media ({len(items)} media candidates)")
+    else:
+        print(f"Found {len(posts)} total posts and {len(items)} media candidates")
     if not shutil.which("yt-dlp") and any(item["type"] == "video" for item in items):
         print("yt-dlp not found: videos will be skipped and retried next run (pip install yt-dlp)", file=sys.stderr)
 
